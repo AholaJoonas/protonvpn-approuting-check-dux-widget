@@ -17,6 +17,7 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -66,7 +67,7 @@ def split_config():
 def proc_info(pid, cache):
     if pid in cache:
         return cache[pid]
-    info = {"exe": "", "ppid": 0, "cmdline": []}
+    info = {"exe": "", "ppid": 0, "cmdline": [], "comm": "", "paths": []}
     try:
         info["exe"] = os.readlink(f"/proc/{pid}/exe").removesuffix(" (deleted)")
     except OSError:
@@ -81,8 +82,31 @@ def proc_info(pid, cache):
             info["cmdline"] = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
     except OSError:
         pass
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            info["comm"] = f.read().strip()
+    except OSError:
+        pass
+    info["paths"] = match_paths(info)
     cache[pid] = info
     return info
+
+
+def match_paths(info):
+    """Paths a process can be matched by: its resolved binary and, because Proton
+    doesn't resolve symlinks, the path it was launched as (argv[0], looked up in
+    PATH when it is a bare name)."""
+    paths = [info["exe"]] if info["exe"] else []
+    argv0 = info["cmdline"][0] if info["cmdline"] else ""
+    if argv0 and "/" not in argv0:
+        argv0 = shutil.which(argv0) or ""
+    if argv0.startswith("/") and argv0 not in paths:
+        paths.append(argv0)
+    return paths
+
+
+def matches(info, path):
+    return any(p.startswith(path) for p in info["paths"])
 
 
 def matched_path(pid, paths, cache):
@@ -92,7 +116,7 @@ def matched_path(pid, paths, cache):
         seen.add(pid)
         info = proc_info(pid, cache)
         for p in paths:
-            if info["exe"].startswith(p):
+            if matches(info, p):
                 return p
         pid = info["ppid"]
     return None
@@ -128,7 +152,8 @@ def build_report(cache):
         if not local or not peer or not peer.is_global:
             continue  # LAN, loopback, Tailscale etc. never use the tunnel anyway
         route = "vpn" if local in vpn_ips else "direct"
-        for comm, pid in USERS_RE.findall(" ".join(cols[5:])):
+        counted = set()  # ss lists every (pid, fd) holding the socket; count it once per app
+        for comm, pid in dict.fromkeys(USERS_RE.findall(" ".join(cols[5:]))):
             pid = int(pid)
             path = matched_path(pid, split["paths"], cache) if split["enabled"] else None
             if not vpn["up"]:
@@ -145,7 +170,9 @@ def build_report(cache):
                 "expected": expected, "vpn": 0, "direct": 0,
                 "pids": set(), "procs": set(),
             })
-            a[route] += 1
+            if key not in counted:
+                counted.add(key)
+                a[route] += 1
             a["pids"].add(pid)
             a["procs"].add(comm)
 
