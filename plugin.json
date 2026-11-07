@@ -1,0 +1,13 @@
+{
+    "id": "vpnRoutes",
+    "name": "VPN Routes",
+    "description": "Shows which apps actually go through the Proton VPN tunnel and flags split-tunnel apps that need a restart",
+    "version": "1.0.0",
+    "author": "jeebus",
+    "type": "widget",
+    "capabilities": ["dankbar-widget"],
+    "component": "./VpnRoutesWidget.qml",
+    "icon": "vpn_lock",
+    "settings": "./VpnRoutesSettings.qml",
+    "permissions": ["settings_read", "settings_write"]
+}

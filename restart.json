@@ -1,0 +1,22 @@
+{
+    "_comment": "Per-app restart overrides for the VPN Routes widget. Keys are the app name shown in the widget (case-insensitive) or its exclude path. 'stop' = command used instead of SIGTERM, 'launch' = command used instead of the original command line, 'block_if' = regex; if any running process's command line matches, the restart is refused. 'timeout' = seconds to wait for the app to quit.",
+    "Steam": {
+        "stop": ["/usr/bin/steam", "-shutdown"],
+        "launch": ["/usr/bin/steam"],
+        "block_if": "SteamLaunch AppId=",
+        "block_message": "A Steam game is running; close it first.",
+        "timeout": 40
+    },
+    "Spotify": {
+        "_why": "Spotify catches SIGTERM and keeps running; quit it over MPRIS instead",
+        "stop": ["busctl", "--user", "call", "org.mpris.MediaPlayer2.spotify",
+                 "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2", "Quit"],
+        "launch": ["spotify-launcher"]
+    },
+    "Brave": {
+        "launch": ["brave-origin"]
+    },
+    "Vivaldi": {
+        "launch": ["/usr/bin/vivaldi-stable"]
+    }
+}
