@@ -6,6 +6,8 @@ This is a [Dux Shell](https://duxlabs.dev) (formerly DankMaterialShell) bar widg
 
 Proton's split tunnelling only applies to connections an app opens *after* Proton starts tracking it. An app that was already running when the VPN connected stays in the tunnel until it's restarted, and nothing on screen tells you.
 
+![The VPN Routes popout: Firefox, Spotify and Steam excluded and going direct, Vivaldi going through the VPN](screenshot.png)
+
 ## Install
 
 ```sh
