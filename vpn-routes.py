@@ -27,9 +27,13 @@ IFACE = os.environ.get("VPN_IFACE", "proton0")
 SETTINGS = os.path.expanduser("~/.config/Proton/VPN/settings.json")
 RECIPES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "restart.json")
 USERS_RE = re.compile(r'\("([^"]*)",pid=(\d+),fd=\d+\)')
-# Never stop these, whatever the report says.
+# Never stop these, whatever the report says. Matched against the binary, comm,
+# argv[0] and, for interpreters, the script name (with version suffixes removed).
 PROTECTED = {"qs", "quickshell", "niri", "systemd", "dms", "dbus-daemon", "dbus-broker",
-             "pipewire", "wireplumber", "protonvpn-app", "python", "python3"}
+             "pipewire", "wireplumber", "protonvpn-app", "python"}
+INTERPRETERS = {"python", "perl", "ruby", "node", "bash", "sh", "zsh", "fish"}
+# Seconds to wait after relaunching before checking the app didn't fail straight away.
+LAUNCH_CHECK = 2
 
 
 def run(cmd):
@@ -210,24 +214,28 @@ def alive(pid):
         return False
 
 
-def belongs(info, app, root_exe):
-    if app["match"]:
-        return info["exe"].startswith(app["match"])
-    return bool(info["exe"]) and info["exe"] == root_exe
-
-
 def find_roots(app, cache):
-    """Topmost ancestor of each socket-owning pid that still belongs to the app."""
+    """Top process of the app for each socket-owning pid.
+
+    For an app matched by a config path, that is the topmost ancestor matching the
+    path, even through non-matching processes in between (e.g. an `sh -c` wrapper),
+    the same way Proton matches. Otherwise it is the topmost ancestor in an unbroken
+    chain of processes running the same binary."""
     roots = set()
     for pid in app["pids"]:
         own_exe = proc_info(pid, cache)["exe"]
         root, cur, seen = pid, pid, set()
         while cur > 1 and cur not in seen:
             seen.add(cur)
-            parent = proc_info(cur, cache)["ppid"]
-            if parent <= 1 or not belongs(proc_info(parent, cache), app, own_exe):
+            info = proc_info(cur, cache)
+            if app["match"]:
+                if matches(info, app["match"]):
+                    root = cur
+            elif own_exe and info["exe"] == own_exe:
+                root = cur
+            else:
                 break
-            root = cur = parent
+            cur = info["ppid"]
         roots.add(root)
 
     # Drop roots that descend from another root (e.g. Claude's VM under its helper):
@@ -258,8 +266,9 @@ def load_recipe(app):
 
 def any_cmdline_matches(pattern):
     rx = re.compile(pattern)
+    me = str(os.getpid())  # our own command line contains the app key
     for d in os.listdir("/proc"):
-        if not d.isdigit():
+        if not d.isdigit() or d == me:
             continue
         try:
             with open(f"/proc/{d}/cmdline", "rb") as f:
@@ -268,6 +277,45 @@ def any_cmdline_matches(pattern):
         except OSError:
             pass
     return False
+
+
+def proc_names(info):
+    """Names a process goes by, for the PROTECTED check. python3.14 -> python, and
+    for an interpreter the script it runs (protonvpn-app's binary is python)."""
+    names = {os.path.basename(info["exe"]), info["comm"]}
+    if info["cmdline"]:
+        names.add(os.path.basename(info["cmdline"][0]))
+    names.discard("")
+    names |= {re.sub(r"[\d.]+$", "", n) or n for n in names}
+    if names & INTERPRETERS:
+        script = next((a for a in info["cmdline"][1:] if not a.startswith("-")), "")
+        if script:
+            names.add(os.path.basename(script))
+    return names
+
+
+def flatpak_id(pid):
+    """App ID if the process runs in a Flatpak sandbox; its own binary path only
+    exists inside the sandbox, so it has to be relaunched with `flatpak run`."""
+    try:
+        with open(f"/proc/{pid}/root/.flatpak-info") as f:
+            m = re.search(r"^name=(.+)$", f.read(), re.M)
+            return m.group(1).strip() if m else ""
+    except OSError:
+        return ""
+
+
+def launch_commands(recipe, roots, cache):
+    """One command per separate instance of the app, without duplicates."""
+    if recipe.get("launch"):
+        return [recipe["launch"]]
+    cmds = []
+    for r in roots:
+        app_id = flatpak_id(r)
+        cmd = ["flatpak", "run", app_id] if app_id else proc_info(r, cache)["cmdline"]
+        if cmd and cmd not in cmds:
+            cmds.append(cmd)
+    return cmds
 
 
 def restart(key):
@@ -284,20 +332,25 @@ def restart(key):
     roots = find_roots(app, cache)
     for r in roots:
         info = proc_info(r, cache)
-        if os.path.basename(info["exe"]) in PROTECTED or r == os.getpid():
-            return {"ok": False, "message": f"Refusing to stop protected process {info['exe']}."}
+        hit = proc_names(info) & PROTECTED
+        if hit or r == os.getpid():
+            what = ", ".join(sorted(hit)) or info["exe"]
+            return {"ok": False, "message": f"Refusing to stop protected process {what}."}
 
-    launch = recipe.get("launch") or proc_info(roots[0], cache)["cmdline"]
-    if not launch:
+    launches = launch_commands(recipe, roots, cache)
+    if not launches:
         return {"ok": False, "message": f"Could not work out how to start {name} again."}
-    launch = [os.path.expanduser(a) for a in launch]
+    launches = [[os.path.expanduser(a) for a in cmd] for cmd in launches]
     watch = set(roots) | set(app["pids"])
 
     # 1. ask the app to quit
     if recipe.get("stop"):
-        subprocess.Popen([os.path.expanduser(a) for a in recipe["stop"]],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, start_new_session=True)
+        try:
+            subprocess.Popen([os.path.expanduser(a) for a in recipe["stop"]],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError as e:
+            return {"ok": False, "message": f"Couldn't run the stop command for {name}: {e}"}
     else:
         for r in roots:
             try:
@@ -315,12 +368,33 @@ def restart(key):
 
     # 3. start it again in its own scope, so it outlives a shell restart
     slug = re.sub(r"[^A-Za-z0-9]+", "-", name).strip("-").lower() or "app"
-    unit = f"app-vpnroutes-{slug}-{int(time.time())}.scope"
-    subprocess.Popen(["systemd-run", "--user", "--scope", "--collect", "--quiet",
-                      f"--unit={unit}", "--", *launch],
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL, start_new_session=True)
-    return {"ok": True, "message": f"Restarted {name}.", "launch": launch}
+    stamp = int(time.time())
+    started, failed = [], []
+    for i, cmd in enumerate(launches):
+        unit = f"app-vpnroutes-{slug}-{stamp}" + (f"-{i}" if i else "") + ".scope"
+        try:
+            p = subprocess.Popen(["systemd-run", "--user", "--scope", "--collect", "--quiet",
+                                  f"--unit={unit}", "--", *cmd],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError as e:
+            failed.append(f"{os.path.basename(cmd[0])}: {e.strerror or e}")
+            continue
+        started.append((cmd, p))
+
+    # systemd-run --scope becomes the app itself, so a quick non-zero exit means
+    # the launch failed (command not found, crashed on start, ...).
+    if started:
+        time.sleep(LAUNCH_CHECK)
+    for cmd, p in started:
+        rc = p.poll()
+        if rc not in (None, 0):
+            failed.append(f"{os.path.basename(cmd[0])} exited with code {rc}")
+
+    if failed:
+        return {"ok": False, "message": f"{name} was stopped but didn't start again: "
+                + "; ".join(failed), "launch": launches}
+    return {"ok": True, "message": f"Restarted {name}.", "launch": launches}
 
 
 def main():
