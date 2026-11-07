@@ -18,6 +18,15 @@ dms ipc call plugins enable vpnRoutes
 
 Then add **VPN Routes** to the bar in DMS Settings → Plugins. You need `python3`, `ss`, `nmcli` and `systemd-run`. It doesn't need root.
 
+## Update
+
+```sh
+git -C ~/.config/dms/plugins/VpnRoutes pull --ff-only
+dms ipc call plugins reload vpnRoutes
+```
+
+Your widget settings are kept. If you've edited `restart.json` and the update changes it too, `git pull` stops rather than overwrite your edits; run `git -C ~/.config/dms/plugins/VpnRoutes stash` first and `git -C ~/.config/dms/plugins/VpnRoutes stash pop` after to keep your edits.
+
 ## Usage
 
 The bar icon shows the overall state:
