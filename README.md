@@ -33,7 +33,8 @@ Click the icon to see each app with live internet connections and how it's route
 
 - **Routing check:** `vpn-routes.py` reads established sockets with `ss`. A socket's source address shows the route the kernel actually chose: the tunnel IP on `proton0` means VPN, the LAN IP means direct. The script compares that with `~/.config/Proton/VPN/settings.json`.
 - **Ignored traffic:** connections to LAN, loopback and Tailscale addresses are skipped, because they never use the tunnel.
-- **Restart:** the app's top process gets SIGTERM, or a per-app `stop` command. The script waits for it to exit, then relaunches the app in its own `systemd-run --user --scope`. It never SIGKILLs: if the app won't quit, it's left running. The shell, compositor, systemd, D-Bus, PipeWire and the Proton app are never touched.
+- **Matching:** like Proton, an app counts as excluded if it or any ancestor matches a configured path. Both the real binary and the path it was launched as are checked, since Proton doesn't resolve symlinks.
+- **Restart:** the app's top process gets SIGTERM, or a per-app `stop` command. The script waits for it to exit, then relaunches each separate instance in its own `systemd-run --user --scope` (Flatpak apps via `flatpak run`). If a relaunch fails straight away, the widget tells you instead of reporting success. It never SIGKILLs: if the app won't quit, it's left running. The shell, compositor, systemd, D-Bus, PipeWire, the Proton app and anything run by Python are never touched.
 
 ### `restart.json`
 
