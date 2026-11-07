@@ -12,7 +12,12 @@ Usage:
   vpn-routes.py                 print the routing report as JSON (read-only)
   vpn-routes.py restart <key>   gracefully stop the app with that key and
                                 start it again in its own systemd scope
+  vpn-routes.py restart --dry-run <key>
+                                show what a restart would stop and launch,
+                                without doing anything
 """
+
+import contextlib
 import ipaddress
 import json
 import os
@@ -29,8 +34,19 @@ RECIPES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "restart.json
 USERS_RE = re.compile(r'\("([^"]*)",pid=(\d+),fd=\d+\)')
 # Never stop these, whatever the report says. Matched against the binary, comm,
 # argv[0] and, for interpreters, the script name (with version suffixes removed).
-PROTECTED = {"qs", "quickshell", "niri", "systemd", "dms", "dbus-daemon", "dbus-broker",
-             "pipewire", "wireplumber", "protonvpn-app", "python"}
+PROTECTED = {
+    "qs",
+    "quickshell",
+    "niri",
+    "systemd",
+    "dms",
+    "dbus-daemon",
+    "dbus-broker",
+    "pipewire",
+    "wireplumber",
+    "protonvpn-app",
+    "python",
+}
 INTERPRETERS = {"python", "perl", "ruby", "node", "bash", "sh", "zsh", "fish"}
 # Seconds to wait after relaunching before checking the app didn't fail straight away.
 LAUNCH_CHECK = 2
@@ -72,10 +88,8 @@ def proc_info(pid, cache):
     if pid in cache:
         return cache[pid]
     info = {"exe": "", "ppid": 0, "cmdline": [], "comm": "", "paths": []}
-    try:
+    with contextlib.suppress(OSError):
         info["exe"] = os.readlink(f"/proc/{pid}/exe").removesuffix(" (deleted)")
-    except OSError:
-        pass
     try:
         with open(f"/proc/{pid}/stat") as f:
             info["ppid"] = int(f.read().rsplit(")", 1)[1].split()[1])
@@ -127,7 +141,8 @@ def matched_path(pid, paths, cache):
 
 
 def parse_ip(hostport):
-    host = hostport.rsplit(":", 1)[0].strip("[]").split("%")[0]
+    # ss prints "[v6]%iface:port" and "v4%iface:port" for interface-bound sockets
+    host = hostport.rsplit(":", 1)[0].split("%")[0].strip("[]")
     if host.startswith("::ffff:"):
         host = host[7:]
     try:
@@ -169,11 +184,19 @@ def build_report(cache):
             else:
                 expected = "direct" if path else "vpn"
             key = path or comm
-            a = apps.setdefault(key, {
-                "key": key, "name": "", "match": path or "",
-                "expected": expected, "vpn": 0, "direct": 0,
-                "pids": set(), "procs": set(),
-            })
+            a = apps.setdefault(
+                key,
+                {
+                    "key": key,
+                    "name": "",
+                    "match": path or "",
+                    "expected": expected,
+                    "vpn": 0,
+                    "direct": 0,
+                    "pids": set(),
+                    "procs": set(),
+                },
+            )
             if key not in counted:
                 counted.add(key)
                 a[route] += 1
@@ -199,12 +222,17 @@ def build_report(cache):
     order = {"leak": 0, "restart": 1, "ok": 2}
     result.sort(key=lambda a: (order[a["status"]], a["expected"], a["name"].lower()))
     return {
-        "ts": int(time.time()), "vpn": vpn, "split": split,
-        "issues": issues, "leaks": leaks, "apps": result,
+        "ts": int(time.time()),
+        "vpn": vpn,
+        "split": split,
+        "issues": issues,
+        "leaks": leaks,
+        "apps": result,
     }
 
 
 # --------------------------------------------------------------------------- restart
+
 
 def alive(pid):
     try:
@@ -318,7 +346,7 @@ def launch_commands(recipe, roots, cache):
     return cmds
 
 
-def restart(key):
+def restart(key, dry_run=False):
     cache = {}
     app = next((a for a in build_report(cache)["apps"] if a["key"] == key), None)
     if not app:
@@ -343,27 +371,52 @@ def restart(key):
     launches = [[os.path.expanduser(a) for a in cmd] for cmd in launches]
     watch = set(roots) | set(app["pids"])
 
+    if dry_run:
+        if recipe.get("stop"):
+            stop = {"command": [os.path.expanduser(a) for a in recipe["stop"]]}
+        else:
+            stop = {
+                "sigterm": [
+                    {"pid": r, "exe": proc_info(r, cache)["exe"], "cmdline": proc_info(r, cache)["cmdline"]}
+                    for r in roots
+                ]
+            }
+        return {
+            "ok": True,
+            "dry_run": True,
+            "message": f"Would restart {name} (nothing was done).",
+            "stop": stop,
+            "wait_for": sorted(watch),
+            "timeout": float(recipe.get("timeout", 20)),
+            "launch": launches,
+        }
+
     # 1. ask the app to quit
     if recipe.get("stop"):
         try:
-            subprocess.Popen([os.path.expanduser(a) for a in recipe["stop"]],
-                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, start_new_session=True)
+            subprocess.Popen(
+                [os.path.expanduser(a) for a in recipe["stop"]],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
         except OSError as e:
             return {"ok": False, "message": f"Couldn't run the stop command for {name}: {e}"}
     else:
         for r in roots:
-            try:
+            with contextlib.suppress(ProcessLookupError):
                 os.kill(r, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
 
     # 2. wait for it to be gone (never SIGKILL: an app that won't quit is left alone)
     deadline = time.time() + float(recipe.get("timeout", 20))
     while time.time() < deadline and any(alive(p) for p in watch):
         time.sleep(0.25)
     if any(alive(p) for p in watch):
-        return {"ok": False, "message": f"{name} didn't quit within {recipe.get('timeout', 20)} s; not relaunched."}
+        return {
+            "ok": False,
+            "message": f"{name} didn't quit within {recipe.get('timeout', 20)} s; not relaunched.",
+        }
     time.sleep(float(recipe.get("delay", 1)))
 
     # 3. start it again in its own scope, so it outlives a shell restart
@@ -373,10 +426,13 @@ def restart(key):
     for i, cmd in enumerate(launches):
         unit = f"app-vpnroutes-{slug}-{stamp}" + (f"-{i}" if i else "") + ".scope"
         try:
-            p = subprocess.Popen(["systemd-run", "--user", "--scope", "--collect", "--quiet",
-                                  f"--unit={unit}", "--", *cmd],
-                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL, start_new_session=True)
+            p = subprocess.Popen(
+                ["systemd-run", "--user", "--scope", "--collect", "--quiet", f"--unit={unit}", "--", *cmd],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
         except OSError as e:
             failed.append(f"{os.path.basename(cmd[0])}: {e.strerror or e}")
             continue
@@ -392,14 +448,22 @@ def restart(key):
             failed.append(f"{os.path.basename(cmd[0])} exited with code {rc}")
 
     if failed:
-        return {"ok": False, "message": f"{name} was stopped but didn't start again: "
-                + "; ".join(failed), "launch": launches}
+        return {
+            "ok": False,
+            "message": f"{name} was stopped but didn't start again: " + "; ".join(failed),
+            "launch": launches,
+        }
     return {"ok": True, "message": f"Restarted {name}.", "launch": launches}
 
 
 def main():
-    if len(sys.argv) >= 3 and sys.argv[1] == "restart":
-        print(json.dumps(restart(sys.argv[2])))
+    args = sys.argv[1:]
+    if args[:1] == ["restart"]:
+        dry_run = "--dry-run" in args
+        keys = [a for a in args[1:] if a != "--dry-run"]
+        if len(keys) != 1:
+            sys.exit("usage: vpn-routes.py restart [--dry-run] <key>")
+        print(json.dumps(restart(keys[0], dry_run=dry_run), indent=2 if dry_run else None))
     else:
         print(json.dumps(build_report({})))
 

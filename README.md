@@ -62,6 +62,26 @@ The Proton GUI resolves symlinks when you pick an app, so edit `settings.json` d
 ## Debugging
 
 ```sh
-python3 vpn-routes.py | jq               # the widget's data in a terminal
-dms ipc call plugins reload vpnRoutes    # reload after editing
+python3 vpn-routes.py | jq                          # the widget's data in a terminal
+python3 vpn-routes.py restart --dry-run <key>       # what a restart would stop and launch; does nothing
+dms ipc call plugins reload vpnRoutes               # reload after editing
+```
+
+`<key>` is the app's `key` from the report: its matched exclude path, or its process name.
+
+## Development
+
+The tests never touch real processes: process trees are faked and `ss`, `kill` and `systemd-run` are mocked. They need nothing beyond Python:
+
+```sh
+python3 -m unittest
+```
+
+Linting, formatting and pytest are optional and live in a local virtualenv (configured in `pyproject.toml`):
+
+```sh
+python3 -m venv .venv && .venv/bin/pip install ruff pytest
+.venv/bin/ruff check .     # lint
+.venv/bin/ruff format .    # format
+.venv/bin/pytest           # same tests, nicer output
 ```
